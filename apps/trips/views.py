@@ -7,16 +7,13 @@ from rest_framework.permissions import AllowAny
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
+from apps.fuel.cost_calculation import calculate_trip_cost
 from apps.fuel.optimization import optimize_fuel_stops
-from apps.routing.route_analysis import (
-    calculate_route_analysis,
-)
+from apps.routing.route_analysis import calculate_route_analysis
 from apps.routing.station_matching import (
     match_fuel_stations_to_route,
 )
-from apps.trips.serializers import (
-    OptimizeRouteSerializer,
-)
+from apps.trips.serializers import OptimizeRouteSerializer
 
 
 logger = logging.getLogger(__name__)
@@ -91,7 +88,17 @@ class OptimizeRouteAPIView(APIView):
                 mpg=mpg,
             )
 
-            # Collect data-quality information.
+            # Phase 6: Calculate independent trip-cost breakdown.
+            tank_capacity = tank_range / mpg
+
+            cost_summary = calculate_trip_cost(
+                route_distance_miles=route_distance,
+                mpg=mpg,
+                tank_capacity_gallons=tank_capacity,
+                stops=optimization["stops"],
+            )
+
+            # Data-quality information.
             approximate_stops = sum(
                 1
                 for stop in optimization["stops"]
@@ -101,6 +108,7 @@ class OptimizeRouteAPIView(APIView):
             return Response(
                 {
                     "success": True,
+
                     "route": {
                         "start": route_analysis["start"],
                         "destination": route_analysis[
@@ -118,16 +126,30 @@ class OptimizeRouteAPIView(APIView):
                             ]
                         ),
                     },
+
                     "vehicle": {
                         "tank_range_miles": tank_range,
                         "mpg": mpg,
                         "tank_capacity_gallons": round(
-                            tank_range / mpg,
+                            tank_capacity,
                             3,
                         ),
                         "initial_tank_status": "full",
                     },
+
                     "fuel_optimization": optimization,
+
+                    # Phase 6 output.
+                    "cost_summary": {
+                        key: value
+                        for key, value in cost_summary.items()
+                        if key != "stops"
+                    },
+
+                    "fuel_cost_breakdown": {
+                        "stops": cost_summary["stops"],
+                    },
+
                     "station_matching": {
                         "corridor_width_miles": (
                             matching_result["matching"][
@@ -146,6 +168,7 @@ class OptimizeRouteAPIView(APIView):
                             optimization["number_of_stops"]
                         ),
                     },
+
                     "data_quality": {
                         "approximate_coordinate_stops": (
                             approximate_stops
