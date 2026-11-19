@@ -1,342 +1,618 @@
 
-"""
-Fuel station matching against an OSRM road route.
-
-This module:
-- Finds existing FuelStation records near a route.
-- Calculates the nearest point on the route geometry.
-- Measures distance from the route using Haversine distance.
-- Calculates approximate geometric detour distance.
-- Orders stations from origin to destination.
-
-No fuel-stop optimization is performed here.
-"""
-
-from dataclasses import dataclass
-from math import cos, radians
-from typing import Any, Iterable
+import logging
+import math
+import time
+from dataclasses import dataclass, field
+from typing import Any
 
 from apps.fuel.models import FuelStation
-from apps.routing.route_analysis import haversine_distance
 
+logger = logging.getLogger(__name__)
 
-DEFAULT_CORRIDOR_WIDTH_MILES = 10.0
-DEFAULT_MAX_RESULTS = 100
+EARTH_RADIUS_MILES = 3958.8
+MILES_PER_DEGREE_LATITUDE = 69.0
+GRID_CELL_SIZE_MILES = 10.0
 
 
 @dataclass(frozen=True)
 class RouteProjection:
-    """A station's nearest projected position on the route."""
-
     distance_from_start_miles: float
     distance_from_route_miles: float
     latitude: float
     longitude: float
 
 
-def _validate_coordinates(
-    latitude: float,
-    longitude: float,
-) -> bool:
-    """Check whether latitude and longitude are geographically valid."""
+@dataclass(frozen=True)
+class RouteSegment:
+    segment_id: int
+    start_latitude: float
+    start_longitude: float
+    end_latitude: float
+    end_longitude: float
+    start_distance_miles: float
+    segment_length_miles: float
+
+
+@dataclass
+class SpatialRouteIndex:
+    segments: list[RouteSegment]
+    grid: dict[tuple[int, int], set[int]]
+    cell_size_latitude: float
+    cell_size_longitude: float
+    corridor_width_miles: float
+    route_coordinates: list[tuple[float, float]]
+    total_route_distance_miles: float
+    candidate_segment_checks: int = 0
+
+    @property
+    def cells(self):
+        """Backward-compatible public access to spatial grid cells."""
+        return self.grid
+
+
+def _validate_coordinates(latitude: float, longitude: float) -> bool:
+    try:
+        latitude = float(latitude)
+        longitude = float(longitude)
+    except (TypeError, ValueError):
+        return False
 
     return (
-        -90 <= latitude <= 90
-        and -180 <= longitude <= 180
+        math.isfinite(latitude)
+        and math.isfinite(longitude)
+        and -90.0 <= latitude <= 90.0
+        and -180.0 <= longitude <= 180.0
     )
 
 
+def haversine_distance(
+    latitude_1: float,
+    longitude_1: float,
+    latitude_2: float,
+    longitude_2: float,
+) -> float:
+    lat1 = math.radians(latitude_1)
+    lat2 = math.radians(latitude_2)
+
+    delta_lat = math.radians(latitude_2 - latitude_1)
+    delta_lon = math.radians(longitude_2 - longitude_1)
+
+    value = (
+        math.sin(delta_lat / 2) ** 2
+        + math.cos(lat1)
+        * math.cos(lat2)
+        * math.sin(delta_lon / 2) ** 2
+    )
+
+    return 2 * EARTH_RADIUS_MILES * math.asin(
+        min(1.0, math.sqrt(value))
+    )
+
+
+def _normalize_helper_route_coordinates(
+    coordinates: list,
+) -> list[tuple[float, float]]:
+    normalized = []
+
+    for coordinate in coordinates:
+        if not isinstance(coordinate, (list, tuple)) or len(coordinate) < 2:
+            continue
+
+        first = float(coordinate[0])
+        second = float(coordinate[1])
+
+        # Support normalized (latitude, longitude) pairs as well as
+        # GeoJSON (longitude, latitude) coordinate pairs.
+        if (
+            -90.0 <= first <= 90.0
+            and not -90.0 <= second <= 90.0
+        ):
+            latitude, longitude = first, second
+        else:
+            longitude, latitude = first, second
+
+        if _validate_coordinates(latitude, longitude):
+            normalized.append((latitude, longitude))
+
+    return normalized
+
+
+def _get_route_coordinates(route: dict) -> list[tuple[float, float]]:
+    if not isinstance(route, dict):
+        raise ValueError("Route must be a dictionary.")
+
+    route_data = route.get("route", route)
+
+    if not isinstance(route_data, dict):
+        raise ValueError("Invalid route data.")
+
+    geometry = route_data.get("geometry")
+
+    if not isinstance(geometry, dict):
+        raise ValueError("Route geometry is missing.")
+
+    coordinates = geometry.get("coordinates")
+
+    if not isinstance(coordinates, (list, tuple)):
+        raise ValueError("Route geometry coordinates are missing.")
+
+    normalized = []
+
+    # OSRM GeoJSON coordinates are [longitude, latitude].
+    for coordinate in coordinates:
+        if not isinstance(coordinate, (list, tuple)) or len(coordinate) < 2:
+            continue
+
+        try:
+            longitude = float(coordinate[0])
+            latitude = float(coordinate[1])
+        except (TypeError, ValueError):
+            continue
+
+        if _validate_coordinates(latitude, longitude):
+            normalized.append((latitude, longitude))
+
+    if len(normalized) < 2:
+        raise ValueError("Route must contain at least two valid coordinates.")
+
+    return normalized
+
+
 def _project_point_onto_segment(
-    point_latitude: float,
-    point_longitude: float,
+    latitude: float,
+    longitude: float,
     start_latitude: float,
     start_longitude: float,
     end_latitude: float,
     end_longitude: float,
-) -> tuple[float, float, float]:
-    """
-    Project a geographic point onto a route segment.
-
-    Uses a local equirectangular projection to calculate the
-    closest point along the segment.
-
-    Returns:
-        (fraction, projected_latitude, projected_longitude)
-    """
-
-    mean_latitude = radians(
+    start_distance_miles: float = 0.0,
+    segment_length_miles: float | None = None,
+) -> RouteProjection:
+    reference_latitude = math.radians(
         (start_latitude + end_latitude) / 2
     )
 
-    longitude_scale = cos(mean_latitude)
-
-    start_x = start_longitude * longitude_scale
-    start_y = start_latitude
-
-    end_x = end_longitude * longitude_scale
-    end_y = end_latitude
-
-    point_x = point_longitude * longitude_scale
-    point_y = point_latitude
-
-    segment_x = end_x - start_x
-    segment_y = end_y - start_y
-
-    segment_length_squared = (
-        segment_x**2 + segment_y**2
+    longitude_scale = max(
+        abs(math.cos(reference_latitude)),
+        1e-8,
     )
 
-    if segment_length_squared == 0:
+    point_x = (
+        math.radians(longitude - start_longitude)
+        * EARTH_RADIUS_MILES
+        * longitude_scale
+    )
+    point_y = (
+        math.radians(latitude - start_latitude)
+        * EARTH_RADIUS_MILES
+    )
+
+    end_x = (
+        math.radians(end_longitude - start_longitude)
+        * EARTH_RADIUS_MILES
+        * longitude_scale
+    )
+    end_y = (
+        math.radians(end_latitude - start_latitude)
+        * EARTH_RADIUS_MILES
+    )
+
+    segment_squared = end_x**2 + end_y**2
+
+    if segment_squared == 0:
         fraction = 0.0
     else:
         fraction = (
-            (point_x - start_x) * segment_x
-            + (point_y - start_y) * segment_y
-        ) / segment_length_squared
+            point_x * end_x + point_y * end_y
+        ) / segment_squared
 
         fraction = max(0.0, min(1.0, fraction))
 
     projected_latitude = (
-        start_latitude
-        + fraction * (end_latitude - start_latitude)
+        start_latitude + fraction * (end_latitude - start_latitude)
     )
-
     projected_longitude = (
-        start_longitude
-        + fraction * (end_longitude - start_longitude)
+        start_longitude + fraction * (end_longitude - start_longitude)
     )
 
-    return (
-        fraction,
+    cross_track_distance = haversine_distance(
+        latitude,
+        longitude,
         projected_latitude,
         projected_longitude,
     )
 
-
-def find_nearest_route_position(
-    latitude: float,
-    longitude: float,
-    route_coordinates: list[list[float]],
-) -> RouteProjection:
-    """
-    Find the nearest point on a route to a station.
-
-    GeoJSON coordinates use [longitude, latitude].
-    """
-
-    if not _validate_coordinates(latitude, longitude):
-        raise ValueError("Invalid station coordinates.")
-
-    if len(route_coordinates) < 2:
-        raise ValueError(
-            "Route must contain at least two coordinates."
-        )
-
-    cumulative_distance = 0.0
-    best_projection = None
-    best_distance = float("inf")
-
-    for index in range(len(route_coordinates) - 1):
-        start_longitude, start_latitude = route_coordinates[index]
-        end_longitude, end_latitude = route_coordinates[index + 1]
-
-        if not (
-            _validate_coordinates(start_latitude, start_longitude)
-            and _validate_coordinates(end_latitude, end_longitude)
-        ):
-            raise ValueError("Route contains invalid coordinates.")
-
-        segment_distance = haversine_distance(
+    if segment_length_miles is None:
+        segment_length_miles = haversine_distance(
             start_latitude,
             start_longitude,
             end_latitude,
             end_longitude,
         )
 
-        fraction, projected_latitude, projected_longitude = (
-            _project_point_onto_segment(
-                latitude,
-                longitude,
-                start_latitude,
-                start_longitude,
-                end_latitude,
-                end_longitude,
-            )
+    distance_from_start = (
+        start_distance_miles + fraction * segment_length_miles
+    )
+
+    return RouteProjection(
+        distance_from_start_miles=distance_from_start,
+        distance_from_route_miles=cross_track_distance,
+        latitude=projected_latitude,
+        longitude=projected_longitude,
+    )
+
+
+def _grid_cell(
+    latitude: float,
+    longitude: float,
+    cell_size_latitude: float,
+    cell_size_longitude: float,
+) -> tuple[int, int]:
+    return (
+        math.floor(latitude / cell_size_latitude),
+        math.floor(longitude / cell_size_longitude),
+    )
+
+
+def _build_spatial_index(
+    route_coordinates: list[tuple[float, float]],
+    corridor_width_miles: float = 10.0,
+) -> SpatialRouteIndex:
+    if corridor_width_miles <= 0:
+        raise ValueError("corridor_width_miles must be greater than zero.")
+
+    if len(route_coordinates) < 2:
+        raise ValueError("Route must contain at least two coordinates.")
+
+    maximum_latitude = max(
+        abs(latitude) for latitude, _ in route_coordinates
+    )
+
+    cell_size_latitude = GRID_CELL_SIZE_MILES / MILES_PER_DEGREE_LATITUDE
+
+    longitude_scale = max(
+        abs(math.cos(math.radians(maximum_latitude))),
+        0.01,
+    )
+
+    cell_size_longitude = (
+        GRID_CELL_SIZE_MILES
+        / (MILES_PER_DEGREE_LATITUDE * longitude_scale)
+    )
+
+    segments = []
+    grid: dict[tuple[int, int], set[int]] = {}
+
+    cumulative_distance = 0.0
+
+    for index in range(len(route_coordinates) - 1):
+        start_latitude, start_longitude = route_coordinates[index]
+        end_latitude, end_longitude = route_coordinates[index + 1]
+
+        segment_length = haversine_distance(
+            start_latitude,
+            start_longitude,
+            end_latitude,
+            end_longitude,
         )
 
-        distance_from_route = haversine_distance(
+        segment = RouteSegment(
+            segment_id=index,
+            start_latitude=start_latitude,
+            start_longitude=start_longitude,
+            end_latitude=end_latitude,
+            end_longitude=end_longitude,
+            start_distance_miles=cumulative_distance,
+            segment_length_miles=segment_length,
+        )
+
+        segments.append(segment)
+
+        latitude_padding = (
+            corridor_width_miles / MILES_PER_DEGREE_LATITUDE
+        )
+
+        segment_max_latitude = max(
+            abs(start_latitude),
+            abs(end_latitude),
+        )
+
+        segment_longitude_scale = max(
+            abs(math.cos(math.radians(segment_max_latitude))),
+            0.01,
+        )
+
+        longitude_padding = (
+            corridor_width_miles
+            / (MILES_PER_DEGREE_LATITUDE * segment_longitude_scale)
+        )
+
+        min_latitude = min(start_latitude, end_latitude) - latitude_padding
+        max_latitude = max(start_latitude, end_latitude) + latitude_padding
+
+        min_longitude = min(start_longitude, end_longitude) - longitude_padding
+        max_longitude = max(start_longitude, end_longitude) + longitude_padding
+
+        min_row = math.floor(min_latitude / cell_size_latitude)
+        max_row = math.floor(max_latitude / cell_size_latitude)
+
+        min_column = math.floor(min_longitude / cell_size_longitude)
+        max_column = math.floor(max_longitude / cell_size_longitude)
+
+        for row in range(min_row, max_row + 1):
+            for column in range(min_column, max_column + 1):
+                grid.setdefault((row, column), set()).add(index)
+
+        cumulative_distance += segment_length
+
+    return SpatialRouteIndex(
+        segments=segments,
+        grid=grid,
+        cell_size_latitude=cell_size_latitude,
+        cell_size_longitude=cell_size_longitude,
+        corridor_width_miles=corridor_width_miles,
+        route_coordinates=route_coordinates,
+        total_route_distance_miles=cumulative_distance,
+    )
+
+
+def _candidate_segments_for_point(
+    latitude: float,
+    longitude: float,
+    spatial_index: SpatialRouteIndex,
+) -> set[int] | tuple:
+    if not _validate_coordinates(latitude, longitude):
+        return ()
+
+    cell = _grid_cell(
+        latitude,
+        longitude,
+        spatial_index.cell_size_latitude,
+        spatial_index.cell_size_longitude,
+    )
+
+    candidate_ids = spatial_index.cells.get(cell)
+
+    # The empty tuple is intentional: performance tests and callers
+    # use it to identify points outside every indexed corridor cell.
+    if not candidate_ids:
+        return ()
+
+    return candidate_ids
+
+
+def _project_onto_indexed_route(
+    latitude: float,
+    longitude: float,
+    spatial_index: SpatialRouteIndex,
+    candidate_segment_ids=None,
+) -> tuple[RouteProjection | None, int]:
+    if candidate_segment_ids is None:
+        candidate_segment_ids = _candidate_segments_for_point(
             latitude,
             longitude,
-            projected_latitude,
-            projected_longitude,
+            spatial_index,
         )
 
-        if distance_from_route < best_distance:
-            best_distance = distance_from_route
+    if not candidate_segment_ids:
+        return None, 0
 
-            best_projection = RouteProjection(
-                distance_from_start_miles=(
-                    cumulative_distance
-                    + fraction * segment_distance
-                ),
-                distance_from_route_miles=distance_from_route,
-                latitude=projected_latitude,
-                longitude=projected_longitude,
-            )
+    best_projection = None
+    best_distance = float("inf")
+    checks = 0
 
-        cumulative_distance += segment_distance
+    for segment_id in candidate_segment_ids:
+        segment = spatial_index.segments[segment_id]
+        checks += 1
 
-    if best_projection is None:
-        raise ValueError("Unable to project station onto route.")
+        projection = _project_point_onto_segment(
+            latitude,
+            longitude,
+            segment.start_latitude,
+            segment.start_longitude,
+            segment.end_latitude,
+            segment.end_longitude,
+            segment.start_distance_miles,
+            segment.segment_length_miles,
+        )
+
+        if projection.distance_from_route_miles < best_distance:
+            best_distance = projection.distance_from_route_miles
+            best_projection = projection
+
+    if (
+        best_projection is None
+        or best_projection.distance_from_route_miles
+        > spatial_index.corridor_width_miles
+    ):
+        return None, checks
+
+    return best_projection, checks
+
+
+def find_nearest_route_position(
+    latitude: float,
+    longitude: float,
+    route_coordinates: list,
+    corridor_width_miles: float = 10.0,
+) -> RouteProjection:
+    if not _validate_coordinates(latitude, longitude):
+        raise ValueError("Invalid station coordinates.")
+
+    normalized_coordinates = _normalize_helper_route_coordinates(
+        route_coordinates
+    )
+
+    if len(normalized_coordinates) < 2:
+        raise ValueError("Route must contain at least two valid coordinates.")
+
+    best_projection = None
+    best_distance = float("inf")
+    cumulative_distance = 0.0
+
+    for i in range(len(normalized_coordinates) - 1):
+        start_lat, start_lon = normalized_coordinates[i]
+        end_lat, end_lon = normalized_coordinates[i + 1]
+        seg_len = haversine_distance(start_lat, start_lon, end_lat, end_lon)
+
+        projection = _project_point_onto_segment(
+            float(latitude),
+            float(longitude),
+            start_lat,
+            start_lon,
+            end_lat,
+            end_lon,
+            cumulative_distance,
+            seg_len,
+        )
+
+        if projection.distance_from_route_miles < best_distance:
+            best_distance = projection.distance_from_route_miles
+            best_projection = projection
+
+        cumulative_distance += seg_len
 
     return best_projection
 
 
-def _get_route_coordinates(
-    route_analysis: dict[str, Any],
-) -> list[list[float]]:
-    """Extract and validate GeoJSON route coordinates."""
-
-    try:
-        coordinates = route_analysis["route"]["geometry"]["coordinates"]
-    except (KeyError, TypeError):
-        raise ValueError(
-            "Invalid route analysis: GeoJSON geometry is missing."
-        ) from None
-
-    if not isinstance(coordinates, list) or len(coordinates) < 2:
-        raise ValueError(
-            "Route must contain at least two coordinates."
-        )
-
-    return coordinates
-
-
-def _get_stations() -> Iterable[FuelStation]:
-    """Load stations with usable geographic coordinates."""
-
+def _get_stations():
     return FuelStation.objects.filter(
         latitude__isnull=False,
         longitude__isnull=False,
+    ).only(
+        "truckstop_id",
+        "name",
+        "address",
+        "city",
+        "state",
+        "rack_id",
+        "retail_price",
+        "latitude",
+        "longitude",
+        "coordinates_are_approximate",
     )
 
 
-def _serialize_station(
-    station: FuelStation,
-    projection: RouteProjection,
-) -> dict[str, Any]:
-    """
-    Create the structured station matching result.
+def _station_value(station: Any, field_name: str, default=None):
+    if isinstance(station, dict):
+        return station.get(field_name, default)
 
-    Geometric detour assumes the vehicle leaves and rejoins
-    the route at the nearest projected point.
-    """
+    return getattr(station, field_name, default)
+
+
+def _serialize_station(
+    station: Any,
+    projection: RouteProjection,
+) -> dict:
+    retail_price = _station_value(station, "retail_price")
+
+    if retail_price is not None:
+        retail_price = float(retail_price)
+
+    distance_from_route = projection.distance_from_route_miles
 
     return {
-        "truckstop_id": station.truckstop_id,
-        "name": station.name,
-        "address": station.address,
-        "city": station.city,
-        "state": station.state,
-        "rack_id": station.rack_id,
-        "retail_price": station.retail_price,
-        "latitude": station.latitude,
-        "longitude": station.longitude,
-        "coordinates_are_approximate": (
-            station.coordinates_are_approximate
+        "truckstop_id": _station_value(station, "truckstop_id"),
+        "name": _station_value(station, "name"),
+        "address": _station_value(station, "address"),
+        "city": _station_value(station, "city"),
+        "state": _station_value(station, "state"),
+        "rack_id": _station_value(station, "rack_id"),
+        "retail_price": retail_price,
+        "latitude": float(_station_value(station, "latitude")),
+        "longitude": float(_station_value(station, "longitude")),
+        "coordinates_are_approximate": bool(
+            _station_value(station, "coordinates_are_approximate", False)
         ),
-        "distance_from_start_miles": round(
-            projection.distance_from_start_miles,
-            2,
-        ),
-        "distance_from_route_miles": round(
-            projection.distance_from_route_miles,
-            2,
-        ),
-        "detour_distance_miles": round(
-            projection.distance_from_route_miles * 2,
-            2,
-        ),
+        "distance_from_start_miles": projection.distance_from_start_miles,
+        "distance_from_route_miles": distance_from_route,
+        "detour_distance_miles": round(distance_from_route * 2, 2),
     }
 
 
 def match_fuel_stations_to_route(
-    route_analysis: dict[str, Any],
-    corridor_width_miles: float = DEFAULT_CORRIDOR_WIDTH_MILES,
-    max_results: int | None = DEFAULT_MAX_RESULTS,
-    stations: Iterable[FuelStation] | None = None,
-) -> dict[str, Any]:
-    """
-    Match fuel stations to an existing calculated road route.
+    route_analysis: dict,
+    corridor_width_miles: float = 10.0,
+    max_results: int = 100,
+    stations=None,
+) -> dict:
+    started_at = time.perf_counter()
 
-    Args:
-        route_analysis:
-            Output of calculate_route_analysis().
+    if (
+        not isinstance(corridor_width_miles, (int, float))
+        or not math.isfinite(corridor_width_miles)
+        or corridor_width_miles <= 0
+    ):
+        raise ValueError("corridor_width_miles must be greater than zero.")
 
-        corridor_width_miles:
-            Maximum perpendicular distance from route.
+    if max_results is not None and (
+        not isinstance(max_results, int)
+        or isinstance(max_results, bool)
+        or max_results <= 0
+    ):
+        raise ValueError("max_results must be a positive integer.")
 
-        max_results:
-            Maximum number of matched stations.
-            Pass None to return every matching station.
-
-        stations:
-            Optional station collection for testing or reuse.
-            Normally loaded from the FuelStation database.
-
-    Returns:
-        Structured route and station matching information.
-
-    Note:
-        This function does not enforce vehicle tank range.
-        It also does not select optimal fuel stops.
-    """
-
-    if corridor_width_miles < 0:
-        raise ValueError(
-            "Corridor width cannot be negative."
-        )
-
-    if max_results is not None and max_results < 1:
-        raise ValueError(
-            "max_results must be at least 1 or None."
-        )
+    if not isinstance(route_analysis, dict):
+        raise ValueError("route_analysis must be a dictionary.")
 
     route_coordinates = _get_route_coordinates(route_analysis)
 
-    if stations is None:
-        stations = _get_stations()
+    index_started_at = time.perf_counter()
+
+    spatial_index = _build_spatial_index(
+        route_coordinates,
+        corridor_width_miles=float(corridor_width_miles),
+    )
+
+    index_duration = time.perf_counter() - index_started_at
+
+    database_started_at = time.perf_counter()
+
+    station_list = list(_get_stations() if stations is None else stations)
+
+    database_duration = time.perf_counter() - database_started_at
+
+    matching_started_at = time.perf_counter()
 
     matched_stations = []
+    invalid_stations_skipped = 0
+    candidate_segment_checks = 0
 
-    for station in stations:
-        latitude = station.latitude
-        longitude = station.longitude
-
-        if latitude is None or longitude is None:
+    for station in station_list:
+        try:
+            latitude = float(_station_value(station, "latitude"))
+            longitude = float(_station_value(station, "longitude"))
+        except (TypeError, ValueError):
+            invalid_stations_skipped += 1
             continue
 
         if not _validate_coordinates(latitude, longitude):
+            invalid_stations_skipped += 1
             continue
 
-        latitude = float(latitude)
-        longitude = float(longitude)
-
-        projection = find_nearest_route_position(
-            latitude=latitude,
-            longitude=longitude,
-            route_coordinates=route_coordinates,
+        candidate_ids = _candidate_segments_for_point(
+            latitude,
+            longitude,
+            spatial_index,
         )
 
-        if (
-            projection.distance_from_route_miles
-            > corridor_width_miles
-        ):
+        if not candidate_ids:
             continue
 
-        matched_stations.append(
-            _serialize_station(station, projection)
+        projection, checks = _project_onto_indexed_route(
+            latitude,
+            longitude,
+            spatial_index,
+            candidate_ids,
         )
+
+        candidate_segment_checks += checks
+
+        if projection is None:
+            continue
+
+        serialized = _serialize_station(station, projection)
+        matched_stations.append(serialized)
 
     matched_stations.sort(
         key=lambda station: (
@@ -346,25 +622,46 @@ def match_fuel_stations_to_route(
         )
     )
 
-    total_matched = len(matched_stations)
+    total_matched_stations = len(matched_stations)
+    returned_stations = (
+        matched_stations if max_results is None else matched_stations[:max_results]
+    )
 
-    if max_results is not None:
-        matched_stations = matched_stations[:max_results]
+    matching_duration = time.perf_counter() - matching_started_at
+    total_duration = time.perf_counter() - started_at
 
-    route = route_analysis["route"]
+    logger.info(
+        "Station matching completed: stations=%s segments=%s cells=%s "
+        "candidate_checks=%s matched=%s returned=%s invalid=%s "
+        "index_seconds=%.4f database_seconds=%.4f "
+        "matching_seconds=%.4f total_seconds=%.4f",
+        len(station_list),
+        len(spatial_index.segments),
+        len(spatial_index.cells),
+        candidate_segment_checks,
+        total_matched_stations,
+        len(returned_stations),
+        invalid_stations_skipped,
+        index_duration,
+        database_duration,
+        matching_duration,
+        total_duration,
+    )
+
+    route_data = route_analysis.get("route", {})
 
     return {
         "start": route_analysis.get("start"),
         "destination": route_analysis.get("destination"),
-        "route": {
-            "distance_miles": route["distance_miles"],
-            "duration_minutes": route["duration_minutes"],
-        },
+        "route": route_data,
         "matching": {
-            "corridor_width_miles": corridor_width_miles,
-            "total_matched_stations": total_matched,
-            "returned_stations": len(matched_stations),
+            "corridor_width_miles": float(corridor_width_miles),
+            "total_stations_checked": len(station_list),
+            "total_matched_stations": total_matched_stations,
+            "returned_stations": len(returned_stations),
             "max_results": max_results,
+            "candidate_segment_checks": candidate_segment_checks,
+            "invalid_stations_skipped": invalid_stations_skipped,
         },
-        "stations": matched_stations,
+        "stations": returned_stations,
     }
