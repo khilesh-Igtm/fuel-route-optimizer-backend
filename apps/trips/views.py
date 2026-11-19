@@ -23,9 +23,7 @@ class OptimizeRouteAPIView(APIView):
     permission_classes = [AllowAny]
 
     def post(self, request):
-        serializer = OptimizeRouteSerializer(
-            data=request.data
-        )
+        serializer = OptimizeRouteSerializer(data=request.data)
 
         if not serializer.is_valid():
             return Response(
@@ -88,7 +86,7 @@ class OptimizeRouteAPIView(APIView):
                 mpg=mpg,
             )
 
-            # Phase 6: Calculate independent trip-cost breakdown.
+            # Phase 6: Calculate trip cost.
             tank_capacity = tank_range / mpg
 
             cost_summary = calculate_trip_cost(
@@ -98,94 +96,93 @@ class OptimizeRouteAPIView(APIView):
                 stops=optimization["stops"],
             )
 
-            # Data-quality information.
+            # Data quality information.
             approximate_stops = sum(
                 1
                 for stop in optimization["stops"]
                 if stop["coordinates_are_approximate"]
             )
 
-            return Response(
-                {
-                    "success": True,
+            response_data = {
+                "success": True,
 
-                    "route": {
-                        "start": route_analysis["start"],
-                        "destination": route_analysis[
-                            "destination"
-                        ],
-                        "distance_miles": route_distance,
-                        "duration_minutes": (
-                            route_analysis["route"][
-                                "duration_minutes"
-                            ]
-                        ),
-                        "geometry": (
-                            route_analysis["route"][
-                                "geometry"
-                            ]
-                        ),
-                    },
-
-                    "vehicle": {
-                        "tank_range_miles": tank_range,
-                        "mpg": mpg,
-                        "tank_capacity_gallons": round(
-                            tank_capacity,
-                            3,
-                        ),
-                        "initial_tank_status": "full",
-                    },
-
-                    "fuel_optimization": optimization,
-
-                    # Phase 6 output.
-                    "cost_summary": {
-                        key: value
-                        for key, value in cost_summary.items()
-                        if key != "stops"
-                    },
-
-                    "fuel_cost_breakdown": {
-                        "stops": cost_summary["stops"],
-                    },
-
-                    "station_matching": {
-                        "corridor_width_miles": (
-                            matching_result["matching"][
-                                "corridor_width_miles"
-                            ]
-                        ),
-                        "total_matched_stations": (
-                            matching_result["matching"][
-                                "total_matched_stations"
-                            ]
-                        ),
-                        "stations_considered": len(
-                            matched_stations
-                        ),
-                        "selected_stops": (
-                            optimization["number_of_stops"]
-                        ),
-                    },
-
-                    "data_quality": {
-                        "approximate_coordinate_stops": (
-                            approximate_stops
-                        ),
-                        "has_approximate_coordinates": (
-                            approximate_stops > 0
-                        ),
-                    },
+                "route": {
+                    "start": route_analysis["start"],
+                    "destination": route_analysis["destination"],
+                    "distance_miles": route_distance,
+                    "duration_minutes": (
+                        route_analysis["route"]["duration_minutes"]
+                    ),
+                    "geometry": route_analysis["route"]["geometry"],
                 },
+
+                "vehicle": {
+                    "tank_range_miles": tank_range,
+                    "mpg": mpg,
+                    "tank_capacity_gallons": round(
+                        tank_capacity,
+                        3,
+                    ),
+                    "initial_tank_status": "full",
+                },
+
+                "fuel_optimization": optimization,
+
+                "cost_summary": {
+                    key: value
+                    for key, value in cost_summary.items()
+                    if key != "stops"
+                },
+
+                "fuel_cost_breakdown": {
+                    "stops": cost_summary["stops"],
+                },
+
+                "station_matching": {
+                    "corridor_width_miles": (
+                        matching_result["matching"][
+                            "corridor_width_miles"
+                        ]
+                    ),
+                    "total_matched_stations": (
+                        matching_result["matching"][
+                            "total_matched_stations"
+                        ]
+                    ),
+                    "stations_considered": len(
+                        matched_stations
+                    ),
+                    "selected_stops": (
+                        optimization["number_of_stops"]
+                    ),
+                },
+
+                "data_quality": {
+                    "approximate_coordinate_stops": (
+                        approximate_stops
+                    ),
+                    "has_approximate_coordinates": (
+                        approximate_stops > 0
+                    ),
+                },
+            }
+
+            return Response(
+                response_data,
                 status=status.HTTP_200_OK,
             )
 
         except ValueError as exc:
+            logger.warning(
+                "Route optimization validation failed: %s",
+                str(exc),
+            )
+
             return Response(
                 {
                     "success": False,
                     "error": str(exc),
+                    "error_code": "ROUTE_OPTIMIZATION_ERROR",
                 },
                 status=status.HTTP_422_UNPROCESSABLE_ENTITY,
             )
@@ -202,6 +199,7 @@ class OptimizeRouteAPIView(APIView):
                         "Unable to optimize this route. "
                         "Please try again later."
                     ),
+                    "error_code": "ROUTE_SERVICE_UNAVAILABLE",
                 },
                 status=status.HTTP_502_BAD_GATEWAY,
             )

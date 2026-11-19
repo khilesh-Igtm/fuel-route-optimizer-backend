@@ -28,30 +28,35 @@ class OptimizeRouteSerializer(serializers.Serializer):
     )
 
     def validate_start_location(self, value):
-        if not value.strip():
+        value = value.strip()
+
+        if not value:
             raise serializers.ValidationError(
-                "Start location cannot be empty."
+                "Starting location cannot be empty."
             )
 
-        return value.strip()
+        return value
 
     def validate_end_location(self, value):
-        if not value.strip():
+        value = value.strip()
+
+        if not value:
             raise serializers.ValidationError(
                 "Destination cannot be empty."
             )
 
-        return value.strip()
+        return value
 
     def validate(self, attrs):
-        start = attrs["start_location"].casefold()
-        end = attrs["end_location"].casefold()
+        start = attrs["start_location"]
+        end = attrs["end_location"]
 
-        if start == end:
+        if start.casefold() == end.casefold():
             raise serializers.ValidationError(
                 {
                     "end_location": (
-                        "Start and destination must be different."
+                        "Starting location and destination "
+                        "must be different."
                     )
                 }
             )
