@@ -15,4 +15,5 @@ urlpatterns = [
         "api/v1/",
         include("apps.trips.urls"),
     ),
+    path("", include("apps.routing.map_urls")),
 ]
